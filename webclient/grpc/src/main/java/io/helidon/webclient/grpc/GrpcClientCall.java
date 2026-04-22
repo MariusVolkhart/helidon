@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,6 +73,9 @@ class GrpcClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void request(int numMessages) {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "request called %d", numMessages);
         messageRequest.release(numMessages);
         startReadBarrier.countDown();
@@ -80,6 +83,9 @@ class GrpcClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void cancel(String message, Throwable cause) {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "cancel called %s", message);
         if (closeCalled.compareAndSet(false, true)) {
             responseListener().onClose(Status.CANCELLED, EMPTY_METADATA);
@@ -93,6 +99,9 @@ class GrpcClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void halfClose() {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "halfClose called");
         sendingQueue.add(EMPTY_BUFFER_DATA);       // end marker
         startWriteBarrier.countDown();
@@ -100,6 +109,9 @@ class GrpcClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void sendMessage(ReqT message) {
+        if (isStartFailed()) {
+            return;
+        }
         // serialize and queue message for writing
         byte[] serialized = serializeMessage(message);
         BufferData messageData = BufferData.createReadOnly(serialized, 0, serialized.length);

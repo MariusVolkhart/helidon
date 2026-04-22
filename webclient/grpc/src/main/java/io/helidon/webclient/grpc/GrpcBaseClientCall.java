@@ -25,6 +25,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -66,6 +67,7 @@ import io.helidon.webclient.http2.Http2ClientProtocolConfig;
 import io.helidon.webclient.http2.Http2StreamConfig;
 import io.helidon.webclient.http2.StreamTimeoutException;
 
+import io.grpc.CallCredentials;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
 import io.grpc.Context;
@@ -122,6 +124,7 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
     private volatile HelidonSocket socket;
     private volatile MethodMetrics methodMetrics;
     private volatile long startMillis;
+    private volatile boolean startFailed;
 
     /**
      * The lesser of the {@link CallOptions} deadline and the ambient {@link Context} deadline,
@@ -176,8 +179,65 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
             methodMetrics.callStarted.increment();
         }
 
-        // Fail fast if deadline already expired — avoids wasting a TCP connection
+        // Resolve URI and assemble headers before opening a connection so that
+        // credential failure can abort without leaking network resources.
+        ClientUri clientUri = nextClientUri();
+        WritableHeaders<?> headers = setupHeaders(metadata, clientUri.authority(), methodDescriptor.getFullMethodName());
+
+        // Apply per-call credentials before opening the connection. Credential
+        // metadata is included in the initial HTTP/2 HEADERS frame.
+        CallCredentials credentials = callOptions.getCredentials();
+        if (credentials != null) {
+            long timeoutMs = credentialTimeoutMs();
+            Metadata[] credentialResult = new Metadata[1];
+            Status[] credentialFailure = new Status[1];
+            CountDownLatch latch = new CountDownLatch(1);
+            credentials.applyRequestMetadata(
+                    new HelidonRequestInfo(methodDescriptor, callOptions,
+                                          clientUri.authority(), grpcConfig.tls().enabled()),
+                    Thread::startVirtualThread,
+                    new CallCredentials.MetadataApplier() {
+                        @Override
+                        public void apply(Metadata credentialHeaders) {
+                            credentialResult[0] = credentialHeaders;
+                            latch.countDown();
+                        }
+
+                        @Override
+                        public void fail(Status status) {
+                            credentialFailure[0] = status;
+                            latch.countDown();
+                        }
+                    });
+            try {
+                if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    startFailed = true;
+                    responseListener.onClose(
+                            Status.DEADLINE_EXCEEDED.withDescription("Timed out waiting for call credentials"),
+                            new Metadata());
+                    return;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                startFailed = true;
+                responseListener.onClose(
+                        Status.CANCELLED.withDescription("Interrupted waiting for call credentials"),
+                        new Metadata());
+                return;
+            }
+            if (credentialFailure[0] != null) {
+                startFailed = true;
+                responseListener.onClose(credentialFailure[0], new Metadata());
+                return;
+            }
+            GrpcHeadersUtil.updateHeaders(headers, credentialResult[0]);
+        }
+
+        // Fail fast if deadline already expired — avoids wasting a TCP connection.
+        // Checked after credentials so that locally-resolved credentials are not
+        // discarded unnecessarily.
         if (effectiveDeadline != null && effectiveDeadline.isExpired()) {
+            startFailed = true;
             responseListener.onClose(Status.DEADLINE_EXCEEDED
                     .withDescription("deadline expired before call started"), EMPTY_METADATA);
             unblockUnaryExecutor();
@@ -185,7 +245,6 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
         }
 
         // obtain HTTP2 connection
-        ClientUri clientUri = nextClientUri();
         ClientConnection clientConnection = clientConnection(clientUri);
         socket = clientConnection.helidonSocket();
         connection = Http2ClientConnection.create((Http2ClientImpl) grpcClient.http2Client(),
@@ -225,9 +284,7 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
         // start streaming threads
         startStreamingThreads();
 
-        // send HEADERS frame
-        WritableHeaders<?> headers = setupHeaders(metadata, clientUri.authority(), methodDescriptor.getFullMethodName());
-        // Write grpc-timeout header after metadata conversion so it cannot be overwritten
+        // Write grpc-timeout header after credential metadata so it cannot be overwritten
         if (effectiveDeadline != null) {
             long timeoutNanos = effectiveDeadline.timeRemaining(TimeUnit.NANOSECONDS);
             String encoded = GrpcHeadersUtil.encodeTimeout(timeoutNanos);
@@ -411,6 +468,14 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
         return clientStream;
     }
 
+    /**
+     * Returns {@code true} when {@link #start} closed the call early (for example, because
+     * credentials timed out). Subclasses must skip stream I/O when this flag is set.
+     */
+    boolean isStartFailed() {
+        return startFailed;
+    }
+
     Listener<ResT> responseListener() {
         return responseListener;
     }
@@ -468,6 +533,22 @@ abstract class GrpcBaseClientCall<ReqT, ResT> extends ClientCall<ReqT, ResT> {
                 .add(Http2Setting.MAX_FRAME_SIZE, (long) config.maxFrameSize())
                 .add(Http2Setting.ENABLE_PUSH, false)
                 .build();
+    }
+
+    /**
+     * Compute the timeout in milliseconds to wait for {@link io.grpc.CallCredentials}
+     * to apply their metadata.
+     *
+     * <p>Uses remaining time from the call deadline if one is set; otherwise falls back
+     * to {@code pollWaitTime} from the protocol config.
+     *
+     * @return timeout in milliseconds; zero or negative means the deadline has already passed
+     */
+    private long credentialTimeoutMs() {
+        if (effectiveDeadline != null) {
+            return effectiveDeadline.timeRemaining(TimeUnit.MILLISECONDS);
+        }
+        return pollWaitTime.toMillis();
     }
 
     void initMetrics() {

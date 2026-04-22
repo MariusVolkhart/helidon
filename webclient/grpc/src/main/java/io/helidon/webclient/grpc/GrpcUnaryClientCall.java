@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, 2025 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -61,6 +61,9 @@ class GrpcUnaryClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void request(int numMessages) {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "request called %d", numMessages);
         if (numMessages < 1) {
             close(Status.INVALID_ARGUMENT);
@@ -69,12 +72,18 @@ class GrpcUnaryClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void cancel(String message, Throwable cause) {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "cancel called %s", message);
         close(Status.CANCELLED);
     }
 
     @Override
     public void halfClose() {
+        if (isStartFailed()) {
+            return;
+        }
         socket().log(LOGGER, DEBUG, "halfClose called");
         if (responseReceived) {
             if (responseHeaders != null) {
@@ -93,6 +102,10 @@ class GrpcUnaryClientCall<ReqT, ResT> extends GrpcBaseClientCall<ReqT, ResT> {
 
     @Override
     public void sendMessage(ReqT message) {
+        // start() closed the call early (e.g. credential timeout); nothing to send
+        if (isStartFailed()) {
+            return;
+        }
         // should only be called once
         if (requestSent) {
             close(Status.FAILED_PRECONDITION);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Oracle and/or its affiliates.
+ * Copyright (c) 2024, 2026 Oracle and/or its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import io.helidon.grpc.core.WeightedBag;
 
+import io.grpc.CallCredentials;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -181,9 +182,20 @@ class GrpcServiceClientImpl implements GrpcServiceClient {
                     + ", yet " + methodType + " was requested.");
         }
 
+        // Resolve credentials: method-level overrides service-level.
+        // GrpcClientMethodDescriptor.callCredentials() returns nullable CallCredentials.
+        // GrpcServiceDescriptorBlueprint.callCredentials() returns Optional<CallCredentials>.
+        CallCredentials credentials = methodDescriptor.callCredentials();
+        if (credentials == null) {
+            credentials = serviceDescriptor.callCredentials().orElse(null);
+        }
+        CallOptions callOptions = credentials != null
+                ? CallOptions.DEFAULT.withCallCredentials(credentials)
+                : CallOptions.DEFAULT;
+
         // use channel that contains all service and method interceptors
         if (methodDescriptor.interceptors().isEmpty()) {
-            return serviceChannel.newCall(methodDescriptor.descriptor(), CallOptions.DEFAULT);
+            return serviceChannel.newCall(methodDescriptor.descriptor(), callOptions);
         } else {
             Channel methodChannel = methodCache.computeIfAbsent(methodName, k -> {
                 WeightedBag<ClientInterceptor> interceptors = WeightedBag.create();
@@ -194,7 +206,7 @@ class GrpcServiceClientImpl implements GrpcServiceClient {
                 List<ClientInterceptor> orderedInterceptors = interceptors.stream().toList().reversed();
                 return ClientInterceptors.intercept(grpcClient.channel(), orderedInterceptors);
             });
-            return methodChannel.newCall(methodDescriptor.descriptor(), CallOptions.DEFAULT);
+            return methodChannel.newCall(methodDescriptor.descriptor(), callOptions);
         }
     }
 }
